@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "maps": [
+    {
+      "id": "mexico",
+      "name": "墨西哥",
+      "dtlx": 1,
+      "commonName": "swgq2",
+      "tileTemplate": "mapdata/tiles/mexico/{z}/{x}/{y}.png",
+      "mapSize": 16384,
+      "mapMaxZoom": 6,
+      "dataFile": "maps/mexico.json"
+    },
+    {
+      "id": "australia",
+      "name": "澳大利亚",
+      "dtlx": 2,
+      "commonName": "swgq2_2",
+      "tileTemplate": "mapdata/tiles/australia/{z}/{x}/{y}.png",
+      "mapSize": 16384,
+      "mapMaxZoom": 6,
+      "dataFile": "maps/australia.json"
+    }
+  ]
+}

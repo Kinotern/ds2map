@@ -1,0 +1,66 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>死亡搁浅2互动地图</title>
+  <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="./assets/app.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-head">
+        <h1>死亡搁浅2互动地图</h1>
+      </header>
+
+      <section class="map-switch" id="mapSwitch"></section>
+
+      <section class="top-actions">
+        <button type="button" id="showAllBtn">显示全部</button>
+        <button type="button" id="hideAllBtn">隐藏全部</button>
+        <button type="button" id="toggleLabelBtn" class="active">显示标点名称</button>
+        <button type="button" id="exportSelectedBtn">导出当前地图</button>
+      </section>
+
+      <section class="search-box">
+        <input id="searchInput" type="text" placeholder="输入地点名称搜索">
+        <ul id="searchResult"></ul>
+      </section>
+
+      <section class="category-wrap" id="categoryWrap"></section>
+    </aside>
+
+    <main class="map-wrap">
+      <div id="map"></div>
+      <div class="theme-dock" id="themeDock">
+        <theme-button id="themeToggle" value="light" size="2"></theme-button>
+      </div>
+      <button id="mobileToggle" class="mobile-toggle" type="button">&#31579;&#36873;</button>
+    </main>
+  </div>
+
+  <script src="./vendor/leaflet/leaflet.js"></script>
+  <script src="./mapdata/profiles.js"></script>
+  <script>
+    (() => {
+      const key = "ds2map_theme_mode_v4";
+      let theme = "light";
+      try {
+        const saved = localStorage.getItem(key);
+        if (saved === "dark" || saved === "light") {
+          theme = saved;
+        } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+          theme = "dark";
+        }
+      } catch {}
+      const button = document.getElementById("themeToggle");
+      if (button) {
+        button.setAttribute("value", theme);
+      }
+    })();
+  </script>
+  <script src="./assets/theme-button-4.js"></script>
+  <script src="./assets/app.js"></script>
+</body>
+</html>

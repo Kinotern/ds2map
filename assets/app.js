@@ -16,6 +16,8 @@
     exportSelectedBtn: document.getElementById("exportSelectedBtn"),
     searchInput: document.getElementById("searchInput"),
     searchResult: document.getElementById("searchResult"),
+    searchClearBtn: document.getElementById("searchClearBtn"),
+    mapSearch: document.getElementById("mapSearch"),
     sidebar: document.getElementById("sidebar"),
     mobileToggle: document.getElementById("mobileToggle"),
     themeToggle: document.getElementById("themeToggle"),
@@ -48,6 +50,21 @@
   const REMOTE_MAP_ID_BY_PROFILE_ID = {
     mexico: 108,
     australia: 109,
+  };
+  const REMOTE_CATALOG_ICON_OVERRIDES = {
+    5105: "ico/zipline.png",
+    5106: "ico/bridge.png",
+    5107: "ico/jump-ramp.png",
+    5108: "ico/ladder.png",
+    5109: "ico/climbing-anchor.png",
+    5110: "ico/cargo-launcher.png",
+    5111: "ico/watchtower.png",
+    5112: "ico/timefall-shelter.png",
+    5113: "ico/shelter.png",
+    5114: "ico/generator.png",
+    5115: "ico/postbox.png",
+    5116: "ico/magellan-stop.png",
+    5117: "ico/hot-spring.png",
   };
   const remoteProfilePromises = new Map();
 
@@ -110,6 +127,188 @@
       return `${profileId}:remote:${point.remoteLandmarkId}`;
     }
     return `${profileId}:${categoryKey}:${point && point.id ? point.id : "point"}`;
+  }
+
+  function resolveCatalogIcon(catalogId, fallbackIcon, remoteIconUrl) {
+    const overrideIcon = REMOTE_CATALOG_ICON_OVERRIDES[catalogId];
+    if (overrideIcon) {
+      return overrideIcon;
+    }
+    if (fallbackIcon) {
+      return fallbackIcon;
+    }
+    return String(remoteIconUrl || "").trim();
+  }
+
+  function fitLinearTransform(pairs) {
+    const validPairs = pairs.filter((pair) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
+    if (validPairs.length < 2) {
+      return null;
+    }
+
+    const meanX = validPairs.reduce((sum, pair) => sum + pair[0], 0) / validPairs.length;
+    const meanY = validPairs.reduce((sum, pair) => sum + pair[1], 0) / validPairs.length;
+    let varianceX = 0;
+    let covariance = 0;
+
+    validPairs.forEach(([x, y]) => {
+      varianceX += (x - meanX) * (x - meanX);
+      covariance += (x - meanX) * (y - meanY);
+    });
+
+    if (!varianceX) {
+      return null;
+    }
+
+    const slope = covariance / varianceX;
+    const intercept = meanY - slope * meanX;
+    return { intercept, slope };
+  }
+
+  function computeProfileCoordinateTransform(localSectionsById, landmarksByCatalogId) {
+    const xPairs = [];
+    const yPairs = [];
+
+    localSectionsById.forEach((section, sectionId) => {
+      const localPoints = section && Array.isArray(section.data) ? section.data : [];
+      const remotePoints = landmarksByCatalogId.get(sectionId) || [];
+      if (!localPoints.length || !remotePoints.length) {
+        return;
+      }
+
+      const localTitleCount = new Map();
+      localPoints.forEach((point) => {
+        const titleKey = normalizePointTitle(point.title);
+        if (!titleKey) {
+          return;
+        }
+        localTitleCount.set(titleKey, (localTitleCount.get(titleKey) || 0) + 1);
+      });
+
+      const remotePointsByTitle = new Map();
+      const remoteTitleCount = new Map();
+      remotePoints.forEach((remotePoint) => {
+        const titleKey = normalizePointTitle(remotePoint.name);
+        if (!titleKey) {
+          return;
+        }
+        remoteTitleCount.set(titleKey, (remoteTitleCount.get(titleKey) || 0) + 1);
+        remotePointsByTitle.set(titleKey, remotePoint);
+      });
+
+      localPoints.forEach((point) => {
+        const titleKey = normalizePointTitle(point.title);
+        if (!titleKey || localTitleCount.get(titleKey) !== 1 || remoteTitleCount.get(titleKey) !== 1) {
+          return;
+        }
+        const remotePoint = remotePointsByTitle.get(titleKey);
+        if (!remotePoint) {
+          return;
+        }
+        xPairs.push([remotePoint.x, point.x]);
+        yPairs.push([remotePoint.y, point.y]);
+      });
+    });
+
+    const xTransform = fitLinearTransform(xPairs);
+    const yTransform = fitLinearTransform(yPairs);
+    if (!xTransform || !yTransform) {
+      return null;
+    }
+
+    return {
+      x: xTransform,
+      y: yTransform,
+    };
+  }
+
+  function projectRemotePoint(transform, remotePoint) {
+    if (
+      !transform ||
+      !transform.x ||
+      !transform.y ||
+      !Number.isFinite(remotePoint && remotePoint.x) ||
+      !Number.isFinite(remotePoint && remotePoint.y)
+    ) {
+      return null;
+    }
+
+    return {
+      x: transform.x.intercept + transform.x.slope * remotePoint.x,
+      y: transform.y.intercept + transform.y.slope * remotePoint.y,
+    };
+  }
+
+  function normalizeRemotePointName(sectionId, remotePoint, fallbackTitle) {
+    const rawName = String((remotePoint && remotePoint.name) || "").trim();
+    if (!rawName) {
+      return fallbackTitle;
+    }
+
+    if (sectionId === 5094) {
+      const highwayMatch = rawName.match(/^AUS-HIGHWAY-(\d{2}-\d{2})$/i);
+      if (highwayMatch) {
+        return `自动铺路机-${highwayMatch[1]}`;
+      }
+      if (/^自动铺路机\d{2}-\d{2}$/.test(rawName)) {
+        return rawName.replace(/^自动铺路机(?=\d{2}-\d{2}$)/, "自动铺路机-");
+      }
+    }
+
+    if (sectionId === 5095) {
+      const trackMatch = rawName.match(/^铺轨机([A-Z]{2}\d{2}-\d{2})$/);
+      if (trackMatch) {
+        return `铺轨机-${trackMatch[1]}`;
+      }
+    }
+
+    return rawName;
+  }
+
+  function normalizeRemotePointDescription(sectionId, remotePoint, normalizedTitle) {
+    const text = normalizeDescription(remotePoint && remotePoint.description);
+    if (!text) {
+      return "";
+    }
+
+    const condensedText = text.replace(/\s+/g, "");
+    const condensedTitle = String(normalizedTitle || "")
+      .replace(/\s+/g, "")
+      .replace(/[()（）[\]【】-]/g, "");
+
+    if (condensedText && condensedTitle && condensedText === condensedTitle) {
+      return "";
+    }
+
+    if (sectionId === 5094 && /^自动铺路机\s+AUS-HIGHWAY-\d{2}-\d{2}$/i.test(text)) {
+      return "";
+    }
+
+    return text;
+  }
+
+  function buildMergedPoint(catalogId, point, remotePoint) {
+    const normalizedTitle = normalizeRemotePointName(catalogId, remotePoint, point.title);
+    return {
+      ...point,
+      title: normalizedTitle,
+      description: normalizeRemotePointDescription(catalogId, remotePoint, normalizedTitle),
+      remoteLandmarkId: remotePoint.id,
+      remoteLandmarkUrl: remotePoint.landmarkUrl || "",
+    };
+  }
+
+  function createPointFromRemote(catalogId, remotePoint, coordinate) {
+    const normalizedTitle = normalizeRemotePointName(catalogId, remotePoint, remotePoint.name || `point-${remotePoint.id}`);
+    return {
+      id: remotePoint.id,
+      title: normalizedTitle,
+      x: coordinate.x,
+      y: coordinate.y,
+      description: normalizeRemotePointDescription(catalogId, remotePoint, normalizedTitle),
+      remoteLandmarkId: remotePoint.id,
+      remoteLandmarkUrl: remotePoint.landmarkUrl || "",
+    };
   }
 
   function loadCompletedPointKeys() {
@@ -340,17 +539,6 @@
       return nextProfile;
     }
 
-    const catalogById = new Map();
-    remoteBundle.map.landmarkCatalogGroups.forEach((group) => {
-      group.landmarkCatalogs.forEach((catalog) => {
-        catalogById.set(String(catalog.id), {
-          groupTitle: group.groupName,
-          title: catalog.name,
-          count: catalog.landmarksCount,
-        });
-      });
-    });
-
     const landmarksByCatalogId = new Map();
     remoteBundle.landmarks.forEach((landmark) => {
       const key = String(landmark.landmarkCatalogId);
@@ -360,14 +548,22 @@
       landmarksByCatalogId.get(key).push(landmark);
     });
 
+    const localSectionsById = new Map();
+    nextProfile.points.forEach((group) => {
+      group.data.forEach((section) => {
+        localSectionsById.set(String(section.id), cloneProfile(section));
+      });
+    });
+    const coordinateTransform = computeProfileCoordinateTransform(localSectionsById, landmarksByCatalogId);
+
     nextProfile.name = MAP_NAME_FALLBACK[profileId] || nextProfile.name;
 
-    nextProfile.points.forEach((group) => {
-      let nextGroupTitle = "";
-
-      group.data.forEach((section) => {
-        const catalogMeta = catalogById.get(String(section.id));
-        const remotePoints = landmarksByCatalogId.get(String(section.id)) || [];
+    nextProfile.points = remoteBundle.map.landmarkCatalogGroups.map((group) => ({
+      title: group.groupName,
+      data: group.landmarkCatalogs.map((catalog) => {
+        const localSection = localSectionsById.get(String(catalog.id));
+        const sectionData = localSection && Array.isArray(localSection.data) ? localSection.data : [];
+        const remotePoints = landmarksByCatalogId.get(String(catalog.id)) || [];
         const remoteQueuesByTitle = new Map();
         const usedRemoteIds = new Set();
 
@@ -382,13 +578,7 @@
           remoteQueuesByTitle.get(titleKey).push(remotePoint);
         });
 
-        if (catalogMeta) {
-          section.title = catalogMeta.title;
-          section.num = Number.isFinite(catalogMeta.count) ? catalogMeta.count : section.data.length;
-          nextGroupTitle = nextGroupTitle || catalogMeta.groupTitle;
-        }
-
-        section.data = section.data.map((point, index) => {
+        const mergedPoints = sectionData.map((point, index) => {
           let remotePoint = null;
           const titleKey = normalizePointTitle(point.title);
           const matchedQueue = titleKey ? remoteQueuesByTitle.get(titleKey) : null;
@@ -415,20 +605,29 @@
           }
 
           usedRemoteIds.add(remotePoint.id);
-          return {
-            ...point,
-            title: remotePoint.name || point.title,
-            description: normalizeDescription(remotePoint.description),
-            remoteLandmarkId: remotePoint.id,
-            remoteLandmarkUrl: remotePoint.landmarkUrl || "",
-          };
+          return buildMergedPoint(catalog.id, point, remotePoint);
         });
-      });
+        const appendedPoints = remotePoints
+          .filter((remotePoint) => !usedRemoteIds.has(remotePoint.id))
+          .map((remotePoint) => {
+            const coordinate = projectRemotePoint(coordinateTransform, remotePoint);
+            if (!coordinate) {
+              return null;
+            }
+            return createPointFromRemote(catalog.id, remotePoint, coordinate);
+          })
+          .filter(Boolean);
 
-      if (nextGroupTitle) {
-        group.title = nextGroupTitle;
-      }
-    });
+        return {
+          ...(localSection || {}),
+          id: catalog.id,
+          title: catalog.name,
+          num: Number.isFinite(catalog.landmarksCount) ? catalog.landmarksCount : mergedPoints.length,
+          icon: resolveCatalogIcon(catalog.id, localSection && localSection.icon, catalog.iconUrl),
+          data: mergedPoints.concat(appendedPoints),
+        };
+      }),
+    }));
 
     return nextProfile;
   }
@@ -622,15 +821,16 @@
   function buildCategoryUI(profile) {
     let html = "";
     profile.points.forEach((group, groupIndex) => {
-      html += `<div class="group-card"><h3 class="group-title">${escapeHtml(group.title)}</h3>`;
+      html += `<div class="group-card"><h3 class="group-title">${escapeHtml(group.title)}</h3><div class="group-grid">`;
 
       group.data.forEach((section, sectionIndex) => {
         const categoryKey = `${groupIndex}-${sectionIndex}-${section.id}`;
+        const count = Number.isFinite(section.num) ? section.num : section.data.length;
         html += `
-          <div class="category-item" data-cat-key="${categoryKey}">
+          <div class="category-item${count ? "" : " is-empty"}" data-cat-key="${categoryKey}">
             <img src="${escapeHtml(section.icon)}" alt="">
             <span class="name">${escapeHtml(section.title)}</span>
-            <span class="count">${section.num}</span>
+            <span class="count">${count}</span>
           </div>
         `;
 
@@ -671,10 +871,15 @@
 
           state.pointsIndex.push({
             title: point.title,
+            description: normalizeDescription(point.description),
+            searchTitle: String(point.title || "").toLowerCase(),
+            searchDescription: normalizeDescription(point.description).toLowerCase(),
+            searchKey: pointKey,
             marker,
             categoryKey,
             categoryTitle: section.title,
             groupTitle: group.title,
+            icon: section.icon,
           });
         });
 
@@ -688,7 +893,7 @@
         });
       });
 
-      html += "</div>";
+      html += "</div></div>";
     });
 
     refs.categoryWrap.innerHTML = html;
@@ -1075,38 +1280,90 @@
     updateLabelButton();
   }
 
-  function renderSearchResult(matches) {
-    if (!matches.length) {
+  function renderSearchResult(groups) {
+    const titleMatches = groups && Array.isArray(groups.titleMatches) ? groups.titleMatches : [];
+    const descriptionMatches = groups && Array.isArray(groups.descriptionMatches) ? groups.descriptionMatches : [];
+    if (!titleMatches.length && !descriptionMatches.length) {
       refs.searchResult.innerHTML = "";
       refs.searchResult.classList.remove("show");
+      if (refs.mapSearch) {
+        refs.mapSearch.classList.remove("has-result");
+      }
       return;
     }
 
-    refs.searchResult.innerHTML = matches
-      .map(
-        (item, index) =>
-          `<li data-index="${index}">${escapeHtml(item.title)} <small>(${escapeHtml(item.groupTitle)} / ${escapeHtml(item.categoryTitle)})</small></li>`
-      )
-      .join("");
+    const mapName = getMapDisplayName(state.currentProfileId, state.currentProfile);
+    const renderGroup = (title, items, type) => {
+      if (!items.length) {
+        return "";
+      }
+
+      return `
+        <section class="map-search__group">
+          <h3 class="map-search__group-title">${escapeHtml(title)}</h3>
+          ${items
+            .map((item) => {
+              const description = type === "description" ? item.description : "";
+              return `
+                <button type="button" class="map-search__item" data-search-key="${escapeHtml(item.searchKey)}">
+                  <img class="map-search__item-icon" src="${escapeHtml(item.icon)}" alt="">
+                  <span class="map-search__item-main">
+                    <span class="map-search__item-title">${escapeHtml(item.title)}</span>
+                    ${description ? `<span class="map-search__item-desc">${escapeHtml(description)}</span>` : ""}
+                  </span>
+                  <span class="map-search__item-meta">${escapeHtml(item.categoryTitle)}-${escapeHtml(mapName)}</span>
+                </button>
+              `;
+            })
+            .join("")}
+        </section>
+      `;
+    };
+
+    refs.searchResult.innerHTML =
+      renderGroup("标题中包含", titleMatches, "title") + renderGroup("简介中包含", descriptionMatches, "description");
     refs.searchResult.classList.add("show");
+    if (refs.mapSearch) {
+      refs.mapSearch.classList.add("has-result");
+    }
   }
 
   function handleSearchInput() {
     const keyword = refs.searchInput.value.trim().toLowerCase();
     if (!keyword) {
       state.searchMatches = [];
-      renderSearchResult([]);
+      renderSearchResult({ titleMatches: [], descriptionMatches: [] });
+      if (refs.searchClearBtn) {
+        refs.searchClearBtn.classList.remove("show");
+      }
       return;
     }
 
-    state.searchMatches = state.pointsIndex
-      .filter((item) => item.title.toLowerCase().includes(keyword))
-      .slice(0, 30);
-    renderSearchResult(state.searchMatches);
+    const titleMatches = [];
+    const descriptionMatches = [];
+
+    state.pointsIndex.forEach((item) => {
+      if (item.searchTitle.includes(keyword)) {
+        titleMatches.push(item);
+        return;
+      }
+      if (item.searchDescription.includes(keyword)) {
+        descriptionMatches.push(item);
+      }
+    });
+
+    state.searchMatches = titleMatches.concat(descriptionMatches);
+    renderSearchResult({
+      titleMatches: titleMatches.slice(0, 8),
+      descriptionMatches: descriptionMatches.slice(0, 8),
+    });
+    if (refs.searchClearBtn) {
+      refs.searchClearBtn.classList.add("show");
+    }
   }
 
-  function focusSearchResult(index) {
-    const item = state.searchMatches[index];
+  function focusSearchResult(searchKey) {
+    const item = state.pointsIndex.find((entry) => entry.searchKey === searchKey);
     if (!item) {
       return;
     }
@@ -1116,6 +1373,9 @@
     item.marker.openPopup();
 
     refs.searchResult.classList.remove("show");
+    if (refs.mapSearch) {
+      refs.mapSearch.classList.remove("has-result");
+    }
   }
 
   async function switchProfile(profileId) {
@@ -1173,7 +1433,10 @@
     buildCategoryUI(profile);
     refs.searchInput.value = "";
     state.searchMatches = [];
-    renderSearchResult([]);
+    renderSearchResult({ titleMatches: [], descriptionMatches: [] });
+    if (refs.searchClearBtn) {
+      refs.searchClearBtn.classList.remove("show");
+    }
     updateMapSwitchState();
     updateLabelButton();
     updateShowAllButtonState();
@@ -1197,17 +1460,40 @@
     }
 
     refs.searchInput.addEventListener("input", handleSearchInput);
-    refs.searchResult.addEventListener("click", (event) => {
-      const li = event.target.closest("li[data-index]");
-      if (!li) {
+    refs.searchInput.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") {
         return;
       }
-      focusSearchResult(Number(li.dataset.index));
+      const firstItem = refs.searchResult.querySelector("[data-search-key]");
+      if (!firstItem) {
+        return;
+      }
+      event.preventDefault();
+      focusSearchResult(firstItem.dataset.searchKey);
     });
+    refs.searchResult.addEventListener("click", (event) => {
+      const item = event.target.closest("[data-search-key]");
+      if (!item) {
+        return;
+      }
+      focusSearchResult(item.dataset.searchKey);
+    });
+    if (refs.searchClearBtn) {
+      refs.searchClearBtn.addEventListener("click", () => {
+        refs.searchInput.value = "";
+        state.searchMatches = [];
+        renderSearchResult({ titleMatches: [], descriptionMatches: [] });
+        refs.searchClearBtn.classList.remove("show");
+        refs.searchInput.focus();
+      });
+    }
 
     document.addEventListener("click", (event) => {
-      if (!refs.searchInput.contains(event.target) && !refs.searchResult.contains(event.target)) {
+      if (!refs.mapSearch || !refs.mapSearch.contains(event.target)) {
         refs.searchResult.classList.remove("show");
+        if (refs.mapSearch) {
+          refs.mapSearch.classList.remove("has-result");
+        }
       }
     });
 

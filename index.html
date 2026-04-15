@@ -3,9 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>死亡搁浅2互动地图</title>
   <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="./assets/app.css">
+  <link rel="stylesheet" href="./assets/app.css?v=20260415-search-map">
 </head>
 <body>
   <div class="layout">
@@ -23,16 +26,18 @@
         <button type="button" id="exportSelectedBtn">导出当前地图</button>
       </section>
 
-      <section class="search-box">
-        <input id="searchInput" type="text" placeholder="输入地点名称搜索">
-        <ul id="searchResult"></ul>
-      </section>
-
       <section class="category-wrap" id="categoryWrap"></section>
     </aside>
 
     <main class="map-wrap">
       <div id="map"></div>
+      <div class="map-search" id="mapSearch">
+        <div class="map-search__panel" id="searchResult"></div>
+        <div class="map-search__bar">
+          <input id="searchInput" type="search" placeholder="搜索点位">
+          <button type="button" class="map-search__clear" id="searchClearBtn" aria-label="清空搜索">×</button>
+        </div>
+      </div>
       <div class="theme-dock" id="themeDock">
         <theme-button id="themeToggle" value="light" size="2"></theme-button>
       </div>
@@ -60,7 +65,7 @@
       }
     })();
   </script>
-  <script src="./assets/theme-button-4.js"></script>
-  <script src="./assets/app.js"></script>
+  <script src="./assets/theme-button-4.js?v=20260415-search-map"></script>
+  <script src="./assets/app.js?v=20260415-search-map"></script>
 </body>
 </html>

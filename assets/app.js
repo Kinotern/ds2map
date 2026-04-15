@@ -72,6 +72,8 @@
     mexico: "墨西哥",
     australia: "澳大利亚",
   };
+  const DESCRIPTION_SECTION_PATTERN =
+    "(?:链接条件|连接条件|链接要求|可解锁物品|可解锁道具|可解锁内容|获取方式|订单货物|订单目的地|订单目标|解锁条件|具体位置|任务流程|注意事项|支线剧情|主线剧情|效果)";
 
   function getMapDisplayName(id, profile) {
     if (MAP_NAME_FALLBACK[id]) {
@@ -106,12 +108,110 @@
       .replace(/<p[^>]*>/gi, "")
       .replace(/&nbsp;/gi, " ")
       .replace(/<[^>]+>/g, "");
-    return decodeHtmlEntities(text).replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    return decodeHtmlEntities(text)
+      .replace(/\[可解锁道具\]/g, "[可解锁物品]")
+      .replace(/\[可解锁内容\]/g, "[可解锁物品]")
+      .replace(/\[可解锁物品\]\s*[:：]/g, "[可解锁物品]：")
+      .replace(/[【\[]\s*Lv\s*([1-5])\s*[】\]]\s*/gi, "$1星：")
+      .replace(/[【\[]\s*([1-5])\s*星\s*[】\]]\s*/gi, "$1星：")
+      .replace(/\bLv\s*([1-5])\s*[:：]/gi, "$1星：")
+      .replace(/\bLv\s*([1-5])\b/gi, "$1星")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\r\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   function descriptionToHtml(text) {
-    const safe = escapeHtml(text || "暂无介绍");
-    return safe.replace(/\n/g, "<br>");
+    const normalizedText = String(text || "暂无介绍")
+      .replace(
+        new RegExp(`([^\\n])(?=\\[${DESCRIPTION_SECTION_PATTERN}\\][：:])`, "g"),
+        "$1\n"
+      )
+      .replace(/([^\n])(?=\d星[：:])/g, "$1\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    const lines = normalizedText
+      .split("\n")
+      .map((line) => String(line || "").trim())
+      .flatMap((line) => {
+        const match = line.match(
+          new RegExp(`^(\\[${DESCRIPTION_SECTION_PATTERN}\\][：:])\\s*(.+)$`)
+        );
+        if (!match) {
+          return [line];
+        }
+        return [match[1], match[2]];
+      })
+      .filter(Boolean);
+
+    function splitCompoundRewardContent(content) {
+      const value = String(content || "").trim();
+      if (!value || !/、/.test(value)) {
+        return [value];
+      }
+
+      if (/^\[颜色\]/.test(value) || /基础道具/.test(value)) {
+        return [value];
+      }
+
+      const parts = value
+        .split(/、/)
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      if (parts.length < 2) {
+        return [value];
+      }
+
+      return parts;
+    }
+
+    let previousWasRewardLine = false;
+    return lines
+      .map((line) => {
+        const isSectionLine = new RegExp(`^\\[${DESCRIPTION_SECTION_PATTERN}\\][：:]$`).test(line);
+        const rewardMatch = line.match(/^(\d星[：:])\s*(.+)$/);
+        const isRewardLine = Boolean(rewardMatch);
+        const isIndentedContinuation = previousWasRewardLine && !isSectionLine && !isRewardLine;
+        previousWasRewardLine = isRewardLine || isIndentedContinuation;
+
+        if (rewardMatch) {
+          const rewardParts = splitCompoundRewardContent(rewardMatch[2]);
+          return `
+            <span class="point-popup__description-line point-popup__description-line--reward">
+              <span class="point-popup__description-reward-label">${escapeHtml(rewardMatch[1])}</span>
+              <span class="point-popup__description-reward-content">${escapeHtml(rewardParts[0] || "")}</span>
+            </span>${rewardParts
+              .slice(1)
+              .map(
+                (part) => `
+            <span class="point-popup__description-line point-popup__description-line--reward-continuation">
+              <span class="point-popup__description-reward-label" aria-hidden="true"></span>
+              <span class="point-popup__description-reward-content">${escapeHtml(part)}</span>
+            </span>`
+              )
+              .join("")}
+          `.trim();
+        }
+
+        if (isIndentedContinuation) {
+          return `
+            <span class="point-popup__description-line point-popup__description-line--reward-continuation">
+              <span class="point-popup__description-reward-label" aria-hidden="true"></span>
+              <span class="point-popup__description-reward-content">${escapeHtml(line)}</span>
+            </span>
+          `.trim();
+        }
+
+        const className = isSectionLine
+          ? "point-popup__description-line point-popup__description-line--section"
+          : "point-popup__description-line";
+        return `<span class="${className}">${escapeHtml(line)}</span>`;
+      })
+      .join("");
   }
 
   function normalizePointTitle(text) {

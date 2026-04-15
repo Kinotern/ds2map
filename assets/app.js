@@ -33,12 +33,23 @@
     theme: "light",
     themeSwitchTimer: null,
     exportingIcons: false,
+    enrichedProfiles: new Map(),
+    markerByPointKey: new Map(),
+    completedPointKeys: new Set(),
+    switchRequestToken: 0,
   };
 
   const THEME_STORAGE_KEY = "ds2map_theme_mode_v4";
+  const COMPLETED_POINTS_STORAGE_KEY = "ds2map_completed_points_v1";
   const EXPORT_BUTTON_LABEL = "导出当前地图";
   const EXPORT_LOCALHOST_HINT =
     "若要使用“导出当前标记地图”，请勿直接打开 HTML 文件，请通过 localhost（本地服务器）访问当前页面后再重试。";
+  const REMOTE_API_BASE = "https://mapapi.gamersky.com";
+  const REMOTE_MAP_ID_BY_PROFILE_ID = {
+    mexico: 108,
+    australia: 109,
+  };
+  const remoteProfilePromises = new Map();
 
   const MAP_NAME_FALLBACK = {
     mexico: "墨西哥",
@@ -46,11 +57,408 @@
   };
 
   function getMapDisplayName(id, profile) {
+    if (MAP_NAME_FALLBACK[id]) {
+      return MAP_NAME_FALLBACK[id];
+    }
     const raw = String((profile && profile.name) || "").trim();
     if (raw && !/^\?+$/.test(raw)) {
       return raw;
     }
     return MAP_NAME_FALLBACK[id] || id;
+  }
+
+  function cloneProfile(profile) {
+    if (typeof structuredClone === "function") {
+      return structuredClone(profile);
+    }
+    return JSON.parse(JSON.stringify(profile));
+  }
+
+  function decodeHtmlEntities(text) {
+    const textarea = document.createElement("textarea");
+    textarea.innerHTML = String(text || "");
+    return textarea.value;
+  }
+
+  function normalizeDescription(raw) {
+    const text = String(raw || "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/div>/gi, "\n")
+      .replace(/<div[^>]*>/gi, "")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<p[^>]*>/gi, "")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/<[^>]+>/g, "");
+    return decodeHtmlEntities(text).replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function descriptionToHtml(text) {
+    const safe = escapeHtml(text || "暂无介绍");
+    return safe.replace(/\n/g, "<br>");
+  }
+
+  function normalizePointTitle(text) {
+    return String(text || "")
+      .trim()
+      .replace(/\s+/g, "")
+      .replace(/[()（）[\]【】]/g, "")
+      .toLowerCase();
+  }
+
+  function getPointStorageKey(profileId, categoryKey, point) {
+    if (point && point.remoteLandmarkId) {
+      return `${profileId}:remote:${point.remoteLandmarkId}`;
+    }
+    return `${profileId}:${categoryKey}:${point && point.id ? point.id : "point"}`;
+  }
+
+  function loadCompletedPointKeys() {
+    try {
+      const raw = localStorage.getItem(COMPLETED_POINTS_STORAGE_KEY);
+      if (!raw) {
+        return;
+      }
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        state.completedPointKeys = new Set(list.filter((item) => typeof item === "string"));
+      }
+    } catch {
+      state.completedPointKeys = new Set();
+    }
+  }
+
+  function saveCompletedPointKeys() {
+    try {
+      localStorage.setItem(COMPLETED_POINTS_STORAGE_KEY, JSON.stringify(Array.from(state.completedPointKeys)));
+    } catch {
+      // Ignore storage failures in restricted environments.
+    }
+  }
+
+  function isPointCompleted(pointKey) {
+    return state.completedPointKeys.has(pointKey);
+  }
+
+  function togglePointCompleted(pointKey) {
+    if (!pointKey) {
+      return false;
+    }
+    if (state.completedPointKeys.has(pointKey)) {
+      state.completedPointKeys.delete(pointKey);
+    } else {
+      state.completedPointKeys.add(pointKey);
+    }
+    saveCompletedPointKeys();
+    return state.completedPointKeys.has(pointKey);
+  }
+
+  function syncMarkerCompletedState(marker) {
+    const element = marker && marker.getElement ? marker.getElement() : null;
+    if (!element) {
+      return;
+    }
+    element.classList.toggle("is-completed", isPointCompleted(marker.__pointKey));
+  }
+
+  async function copyText(text) {
+    const value = String(text || "").trim();
+    if (!value) {
+      return false;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      // Ignore clipboard API failures and fall back below.
+    }
+
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand("copy");
+    input.remove();
+    return copied;
+  }
+
+  function getPointCopyText(marker) {
+    const point = marker && marker.__pointData ? marker.__pointData : null;
+    const meta = marker && marker.__popupMeta ? marker.__popupMeta : null;
+    const lines = [point && point.title ? point.title : ""];
+    if (meta && meta.groupTitle && meta.categoryTitle) {
+      lines.push(`${meta.groupTitle} / ${meta.categoryTitle}`);
+    }
+    return lines.filter(Boolean).join("\n");
+  }
+
+  function buildPointPopupContent(marker) {
+    const point = marker && marker.__pointData ? marker.__pointData : null;
+    const meta = marker && marker.__popupMeta ? marker.__popupMeta : null;
+    const title = point && point.title ? point.title : "未命名点位";
+    const description = normalizeDescription(point && point.description);
+    const pointKey = marker && marker.__pointKey ? marker.__pointKey : "";
+    const completed = isPointCompleted(pointKey);
+    const categoryTitle = meta && meta.categoryTitle ? meta.categoryTitle : "";
+    const groupTitle = meta && meta.groupTitle ? meta.groupTitle : "";
+    const detailLine = [groupTitle, categoryTitle].filter(Boolean).join(" / ");
+
+    return `
+      <div class="point-popup" data-point-key="${escapeHtml(pointKey)}">
+        <div class="point-popup__head">
+          <div class="point-popup__title-wrap">
+            <span class="point-popup__title">${escapeHtml(title)}</span>
+            ${meta && meta.icon ? `<img class="point-popup__title-icon" src="${escapeHtml(meta.icon)}" alt="">` : ""}
+          </div>
+          <div class="point-popup__head-actions">
+            <button type="button" class="point-popup__text-action" data-popup-action="locate">定位</button>
+            <button type="button" class="point-popup__close" data-popup-action="close" aria-label="关闭">×</button>
+          </div>
+        </div>
+        <div class="point-popup__description">${descriptionToHtml(description)}</div>
+        <div class="point-popup__meta">${escapeHtml(detailLine || "死亡搁浅 2 互动地图")}</div>
+        <div class="point-popup__footer">
+          <button type="button" class="point-popup__footer-btn" data-popup-action="copy">复制名称</button>
+          <button
+            type="button"
+            class="point-popup__footer-btn point-popup__footer-btn--primary${completed ? " is-completed" : ""}"
+            data-popup-action="complete"
+          >
+            ${completed ? "取消完成" : "完成该点位"}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function refreshMarkerPopup(marker) {
+    if (!marker || !marker.getPopup()) {
+      return;
+    }
+    marker.getPopup().setContent(buildPointPopupContent(marker));
+    marker.__pointTitle = marker.__pointData && marker.__pointData.title ? marker.__pointData.title : marker.__pointTitle;
+    syncMarkerCompletedState(marker);
+  }
+
+  async function handleMapActionClick(event) {
+    const actionButton = event.target.closest("[data-popup-action]");
+    if (!actionButton) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const popup = actionButton.closest(".point-popup");
+    const pointKey = popup ? popup.dataset.pointKey : "";
+    const marker = state.markerByPointKey.get(pointKey);
+    if (!marker) {
+      return;
+    }
+
+    const action = actionButton.dataset.popupAction;
+    if (action === "close") {
+      marker.closePopup();
+      return;
+    }
+
+    if (action === "locate") {
+      state.map.setView(marker.getLatLng(), Math.max(state.map.getZoom(), 4), { animate: true });
+      return;
+    }
+
+    if (action === "copy") {
+      const copied = await copyText(getPointCopyText(marker));
+      if (copied) {
+        const previous = actionButton.textContent;
+        actionButton.textContent = "已复制";
+        window.setTimeout(() => {
+          actionButton.textContent = previous;
+        }, 1200);
+      }
+      return;
+    }
+
+    if (action === "complete") {
+      togglePointCompleted(pointKey);
+      refreshMarkerPopup(marker);
+    }
+  }
+
+  async function postRemoteJson(path, payload) {
+    const response = await fetch(`${REMOTE_API_BASE}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Remote API error: ${response.status} ${path}`);
+    }
+
+    return response.json();
+  }
+
+  async function fetchRemoteProfileBundle(profileId) {
+    const remoteMapId = REMOTE_MAP_ID_BY_PROFILE_ID[profileId];
+    if (!remoteMapId) {
+      return null;
+    }
+
+    const [mapPayload, landmarkPayload] = await Promise.all([
+      postRemoteJson("/map/getMap", { gameMapId: remoteMapId }),
+      postRemoteJson("/landmark/getLandmarkList", {
+        gameMapId: remoteMapId,
+        keyword: null,
+        catalogIdsSelected: [],
+        userId: 0,
+      }),
+    ]);
+
+    if (!mapPayload || mapPayload.error || !mapPayload.map) {
+      throw new Error(`Failed to fetch map metadata for ${profileId}`);
+    }
+    if (!landmarkPayload || landmarkPayload.error || !Array.isArray(landmarkPayload.landmarks)) {
+      throw new Error(`Failed to fetch landmarks for ${profileId}`);
+    }
+
+    return {
+      map: mapPayload.map,
+      landmarks: landmarkPayload.landmarks,
+    };
+  }
+
+  function enrichProfileWithRemoteData(profileId, localProfile, remoteBundle) {
+    const nextProfile = cloneProfile(localProfile);
+    if (!remoteBundle) {
+      return nextProfile;
+    }
+
+    const catalogById = new Map();
+    remoteBundle.map.landmarkCatalogGroups.forEach((group) => {
+      group.landmarkCatalogs.forEach((catalog) => {
+        catalogById.set(String(catalog.id), {
+          groupTitle: group.groupName,
+          title: catalog.name,
+          count: catalog.landmarksCount,
+        });
+      });
+    });
+
+    const landmarksByCatalogId = new Map();
+    remoteBundle.landmarks.forEach((landmark) => {
+      const key = String(landmark.landmarkCatalogId);
+      if (!landmarksByCatalogId.has(key)) {
+        landmarksByCatalogId.set(key, []);
+      }
+      landmarksByCatalogId.get(key).push(landmark);
+    });
+
+    nextProfile.name = MAP_NAME_FALLBACK[profileId] || nextProfile.name;
+
+    nextProfile.points.forEach((group) => {
+      let nextGroupTitle = "";
+
+      group.data.forEach((section) => {
+        const catalogMeta = catalogById.get(String(section.id));
+        const remotePoints = landmarksByCatalogId.get(String(section.id)) || [];
+        const remoteQueuesByTitle = new Map();
+        const usedRemoteIds = new Set();
+
+        remotePoints.forEach((remotePoint) => {
+          const titleKey = normalizePointTitle(remotePoint.name);
+          if (!titleKey) {
+            return;
+          }
+          if (!remoteQueuesByTitle.has(titleKey)) {
+            remoteQueuesByTitle.set(titleKey, []);
+          }
+          remoteQueuesByTitle.get(titleKey).push(remotePoint);
+        });
+
+        if (catalogMeta) {
+          section.title = catalogMeta.title;
+          section.num = Number.isFinite(catalogMeta.count) ? catalogMeta.count : section.data.length;
+          nextGroupTitle = nextGroupTitle || catalogMeta.groupTitle;
+        }
+
+        section.data = section.data.map((point, index) => {
+          let remotePoint = null;
+          const titleKey = normalizePointTitle(point.title);
+          const matchedQueue = titleKey ? remoteQueuesByTitle.get(titleKey) : null;
+          if (matchedQueue && matchedQueue.length) {
+            remotePoint = matchedQueue.shift();
+          }
+
+          if (!remotePoint) {
+            const indexedCandidate = remotePoints[index];
+            if (indexedCandidate && !usedRemoteIds.has(indexedCandidate.id)) {
+              remotePoint = indexedCandidate;
+            }
+          }
+
+          if (!remotePoint) {
+            remotePoint = remotePoints.find((candidate) => !usedRemoteIds.has(candidate.id)) || null;
+          }
+
+          if (!remotePoint) {
+            return {
+              ...point,
+              description: normalizeDescription(point.description),
+            };
+          }
+
+          usedRemoteIds.add(remotePoint.id);
+          return {
+            ...point,
+            title: remotePoint.name || point.title,
+            description: normalizeDescription(remotePoint.description),
+            remoteLandmarkId: remotePoint.id,
+            remoteLandmarkUrl: remotePoint.landmarkUrl || "",
+          };
+        });
+      });
+
+      if (nextGroupTitle) {
+        group.title = nextGroupTitle;
+      }
+    });
+
+    return nextProfile;
+  }
+
+  async function getRenderableProfile(profileId) {
+    if (state.enrichedProfiles.has(profileId)) {
+      return state.enrichedProfiles.get(profileId);
+    }
+
+    if (remoteProfilePromises.has(profileId)) {
+      return remoteProfilePromises.get(profileId);
+    }
+
+    const promise = (async () => {
+      const localProfile = profiles[profileId];
+      const remoteBundle = await fetchRemoteProfileBundle(profileId);
+      const nextProfile = enrichProfileWithRemoteData(profileId, localProfile, remoteBundle);
+      state.enrichedProfiles.set(profileId, nextProfile);
+      remoteProfilePromises.delete(profileId);
+      return nextProfile;
+    })().catch((error) => {
+      console.warn(`Failed to enrich profile "${profileId}" from remote data.`, error);
+      const fallbackProfile = cloneProfile(profiles[profileId]);
+      state.enrichedProfiles.set(profileId, fallbackProfile);
+      remoteProfilePromises.delete(profileId);
+      return fallbackProfile;
+    });
+
+    remoteProfilePromises.set(profileId, promise);
+    return promise;
   }
 
   function escapeHtml(text) {
@@ -160,7 +568,7 @@
       if (!btn) {
         return;
       }
-      switchProfile(btn.dataset.map);
+      void switchProfile(btn.dataset.map);
     });
   }
 
@@ -195,11 +603,15 @@
   }
 
   function clearProfileLayers() {
+    if (state.map) {
+      state.map.closePopup();
+    }
     state.categories.forEach((category) => {
       state.map.removeLayer(category.layer);
     });
     state.categories.clear();
     state.pointsIndex = [];
+    state.markerByPointKey.clear();
 
     if (state.tileLayer) {
       state.map.removeLayer(state.tileLayer);
@@ -226,17 +638,36 @@
         const markers = [];
         const icon = createMarkerIcon(section.icon);
         section.data.forEach((point) => {
+          const pointKey = getPointStorageKey(state.currentProfileId, categoryKey, point);
           const marker = L.marker(unproject(profile, point.x, point.y), {
             icon,
             riseOnHover: true,
           });
 
+          marker.__pointData = point;
+          marker.__popupMeta = {
+            categoryKey,
+            categoryTitle: section.title,
+            groupTitle: group.title,
+            icon: section.icon,
+          };
+          marker.__pointKey = pointKey;
           marker.__pointTitle = point.title;
-          marker.bindPopup(
-            `<strong>${escapeHtml(point.title)}</strong><br>X: ${point.x.toFixed(2)}<br>Y: ${point.y.toFixed(2)}`
-          );
+          marker.bindPopup(buildPointPopupContent(marker), {
+            className: "point-popup-shell",
+            closeButton: false,
+            autoPan: true,
+            autoPanPadding: [32, 32],
+            maxWidth: 460,
+            minWidth: 320,
+          });
+          marker.on("add", () => {
+            syncMarkerCompletedState(marker);
+            setMarkerLabel(marker, state.showLabels);
+          });
           marker.addTo(layer);
           markers.push(marker);
+          state.markerByPointKey.set(pointKey, marker);
 
           state.pointsIndex.push({
             title: point.title,
@@ -307,7 +738,10 @@
     category.visible = shouldShow;
     if (shouldShow) {
       state.map.addLayer(category.layer);
-      category.markers.forEach((marker) => setMarkerLabel(marker, state.showLabels));
+      category.markers.forEach((marker) => {
+        syncMarkerCompletedState(marker);
+        setMarkerLabel(marker, state.showLabels);
+      });
     } else {
       category.markers.forEach((marker) => setMarkerLabel(marker, false));
       state.map.removeLayer(category.layer);
@@ -684,9 +1118,25 @@
     refs.searchResult.classList.remove("show");
   }
 
-  function switchProfile(profileId) {
-    const profile = profiles[profileId];
-    if (!profile) {
+  async function switchProfile(profileId) {
+    const baseProfile = profiles[profileId];
+    if (!baseProfile) {
+      return;
+    }
+
+    const requestToken = ++state.switchRequestToken;
+    state.currentProfileId = profileId;
+    updateMapSwitchState();
+
+    let profile = baseProfile;
+    try {
+      profile = await getRenderableProfile(profileId);
+    } catch (error) {
+      console.warn(`Failed to load renderable profile "${profileId}".`, error);
+      profile = cloneProfile(baseProfile);
+    }
+
+    if (requestToken !== state.switchRequestToken) {
       return;
     }
 
@@ -722,6 +1172,7 @@
 
     buildCategoryUI(profile);
     refs.searchInput.value = "";
+    state.searchMatches = [];
     renderSearchResult([]);
     updateMapSwitchState();
     updateLabelButton();
@@ -764,6 +1215,21 @@
       refs.sidebar.classList.toggle("open");
     });
 
+    const mapContainer = state.map && state.map.getContainer ? state.map.getContainer() : null;
+    if (mapContainer) {
+      mapContainer.addEventListener("click", (event) => {
+        void handleMapActionClick(event);
+      });
+    }
+
+    state.map.on("popupopen", (event) => {
+      const marker = event && event.popup ? event.popup._source : null;
+      if (!marker) {
+        return;
+      }
+      refreshMarkerPopup(marker);
+    });
+
     if (refs.themeToggle) {
       refs.themeToggle.addEventListener("change", handleThemeToggleChange);
     }
@@ -788,9 +1254,10 @@
   }
 
   initTheme();
+  loadCompletedPointKeys();
   buildMapSwitch();
   createMap();
   bindEvents();
   const initial = resolveInitialProfileId() || (profileIds.includes("mexico") ? "mexico" : profileIds[0]);
-  switchProfile(initial);
+  void switchProfile(initial);
 })();
